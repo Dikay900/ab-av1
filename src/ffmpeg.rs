@@ -12,7 +12,7 @@ use std::{
     collections::HashSet,
     fmt::Write,
     hash::{Hash, Hasher},
-    io::Read,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, LazyLock},
@@ -286,40 +286,38 @@ fn ffmpeg_svtav1_version() -> anyhow::Result<String> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    // buffer at least 2x the size of the expected prefix + version
-    // as we'll lose the first half once we start running out of space
-    // Example: "SVT-AV1 Encoder Lib v123.456.678"
-    const BUF_QUARTER_LEN: usize = 64;
-
-    let mut buf = [0; 4 * BUF_QUARTER_LEN];
-    let mut read_up_to = 0;
-    let mut stderr = ffmpeg.stderr.take().context("stderr")?;
+    let mut stderr = BufReader::new(ffmpeg.stderr.take().context("stderr")?);
 
     std::thread::spawn(move || _ = ffmpeg.wait());
 
+    read_svtav1_version(&mut stderr)
+}
+
+/// Read ffmpeg stderr until the svt-av1 version line is found.
+fn read_svtav1_version(reader: &mut impl BufRead) -> anyhow::Result<String> {
+    // Example: "SVT-AV1 Encoder Lib v123.456.678"
+    const PREFIX: &str = "SVT-AV1 Encoder Lib ";
+
+    let mut line = Vec::new();
     loop {
-        let n = stderr.read(&mut buf[read_up_to..])?;
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)?;
         anyhow::ensure!(n != 0, "EOF: No version string found");
 
-        read_up_to += n;
+        let Some(idx) = line.find_iter(PREFIX).next() else {
+            continue;
+        };
 
-        if let Some(idx) = buf[..read_up_to].find_iter("SVT-AV1 Encoder Lib v").next()
-            && let Some(last_byte) = buf[..read_up_to].last()
-            // the last byte should be past of the version bytes
-            && !matches!(*last_byte, b'0'..=b'9' | b'.' | b'v')
-        {
-            let ver: Vec<_> = buf[idx + "SVT-AV1 Encoder Lib v".len()..read_up_to]
-                .iter()
-                .copied()
-                .take_while(|b| matches!(b, b'0'..=b'9' | b'.'))
-                .collect();
+        let ver: Vec<_> = line[idx + PREFIX.len()..]
+            .iter()
+            .copied()
+            .take_while(|b| !b.is_ascii_whitespace())
+            .collect();
 
-            return Ok(String::try_from(ver)?);
-        }
-
-        if read_up_to > 3 * BUF_QUARTER_LEN {
-            buf.rotate_left(2 * BUF_QUARTER_LEN);
-            read_up_to -= 2 * BUF_QUARTER_LEN;
+        if !ver.is_empty() {
+            let version = String::try_from(ver)?;
+            println!("found svt-av1 version: {version}");
+            return Ok(version);
         }
     }
 }
@@ -376,4 +374,117 @@ pub async fn decode(file: &Path, mut on_progress: impl FnMut(FfmpegOut)) -> anyh
     }
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{
+        env, fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        sync::{Mutex, MutexGuard},
+    };
+
+    static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    struct PathGuard(Option<std::ffi::OsString>);
+
+    impl PathGuard {
+        fn prepend(dir: &Path) -> Self {
+            let original = env::var_os("PATH");
+            let mut paths = vec![dir.to_path_buf()];
+            if let Some(path) = &original {
+                paths.extend(env::split_paths(path));
+            }
+            let path = env::join_paths(paths).expect("join PATH");
+            // SAFETY: fake-ffmpeg tests are serialized by PATH_LOCK.
+            unsafe { env::set_var("PATH", path) };
+            Self(original)
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            // SAFETY: fake-ffmpeg tests are serialized by PATH_LOCK.
+            unsafe {
+                match &self.0 {
+                    Some(path) => env::set_var("PATH", path),
+                    None => env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    struct FakeFfmpeg {
+        dir: PathBuf,
+        _path: PathGuard,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl FakeFfmpeg {
+        fn new(script: &str) -> Self {
+            let lock = PATH_LOCK.lock().unwrap();
+            let dir = env::temp_dir().join(format!(
+                "ab-av1-fake-ffmpeg-{}-{}",
+                std::process::id(),
+                fastrand::u64(..)
+            ));
+            fs::create_dir_all(&dir).expect("create fake ffmpeg dir");
+
+            let ffmpeg = dir.join("ffmpeg");
+            fs::write(&ffmpeg, script).expect("write fake ffmpeg");
+            let mut perms = fs::metadata(&ffmpeg).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&ffmpeg, perms).unwrap();
+
+            let path = PathGuard::prepend(&dir);
+            Self {
+                dir,
+                _path: path,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for FakeFfmpeg {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fake_ffmpeg_version(script: &str) -> anyhow::Result<String> {
+        let _fake = FakeFfmpeg::new(script);
+        ffmpeg_svtav1_version()
+    }
+
+    /// The old parser only accepted a version once a later byte was seen, so a
+    /// stream ending on a version digit hit EOF and reported no version.
+    #[test]
+    fn ffmpeg_svtav1_version_at_eof() {
+        let version =
+            fake_ffmpeg_version("#!/bin/sh\nprintf 'SVT-AV1 Encoder Lib v1.2.3' >&2\n").unwrap();
+
+        assert_eq!(version, "v1.2.3");
+    }
+
+    /// Reproduces the intermittent real-world failure: the old parser rotated
+    /// its 256-byte buffer after a read ending in a version character, losing
+    /// the version line before it could parse it.
+    #[test]
+    fn ffmpeg_svtav1_version_across_stderr_chunks() {
+        let script = r#"#!/bin/sh
+printf '%100s' '' | tr ' ' 'x' >&2
+sleep 0.1
+printf 'SVT-AV1 Encoder Lib v4.2.0-210-gf2c3fb786' >&2
+sleep 0.1
+printf '%99s9' '' >&2
+sleep 0.1
+printf '\n' >&2
+"#;
+
+        let version = fake_ffmpeg_version(script).unwrap();
+
+        assert_eq!(version, "v4.2.0-210-gf2c3fb786");
+    }
 }
